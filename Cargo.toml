@@ -20,6 +20,7 @@ members = [
     "testutils",
     "integration_tests",
     "remitwise-common",
+    "benchmarks",
 ]
 exclude = [
     "bill_payments",

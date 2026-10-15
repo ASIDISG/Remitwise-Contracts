@@ -1,0 +1,12 @@
+[package]
+name = "remitwise-benchmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dev-dependencies]
+soroban-sdk = { version = "=21.7.7", features = ["testutils"] }
+orchestrator = { path = "../orchestrator" }

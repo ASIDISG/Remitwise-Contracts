@@ -274,3 +274,38 @@ invariants hold, and that failures are observable through stable error
 output without exposing sensitive data. Benchmarks remain deterministic
 (`RUST_TEST_THREADS=1`) so retries and concurrent execution cannot produce
 an unsafe or inconsistent result.
+
+### `bench_orchestrator_flow` Failure Boundaries
+
+`benchmarks/src/orchestrator_migration_benches.rs` drives the real
+`Orchestrator` contract through its public client against configurable
+downstream doubles (`cargo test -p remitwise-benchmarks`). The crate is a
+workspace member, so the suite also runs under `cargo test --workspace`.
+
+Invariants checked, each against exact boundary values:
+
+- **Success**: one flow updates stats, the audit log and every downstream
+  step exactly once and releases the execution lock. Amounts `1` to `3` split
+  to a zero quarter and call no mutating step; `4` is the first amount that
+  reaches all of them; `i128::MAX` does not overflow.
+- **Invalid input**: `0`, `-1` and `i128::MIN` are `InvalidAmount`; a short
+  split from the split contract is `InvalidAmount`.
+- **Permission**: a call without the caller's authorization, a denied
+  spending limit (`Unauthorized`) and a stale actor epoch (`EpochMismatch`)
+  are rejected before any downstream mutation.
+- **Stale**: a signed flow whose deadline is now, in the past, or one second
+  past the one-hour window is `DeadlineExpired`; the last second of the
+  window is accepted.
+- **Duplicate**: a replayed nonce is `NonceAlreadyUsed`, a skipped nonce or a
+  hash that does not bind the parameters is `InvalidNonce`.
+- **Concurrent**: a flow that starts while the execution lock is held is
+  `ExecutionLocked` and leaves the lock as it found it.
+- **Partial failure and retry**: a failing savings, bills or insurance step
+  is a typed error, leaves *no* partial state (stats, audit log, lock, nonce
+  and downstream call counters equal the pre-call snapshot), and the same
+  request succeeds once the cause is removed.
+- **Cost**: every path, success and rejection, stays within 50M CPU and 2M
+  memory, and the same input costs exactly the same in a fresh environment.
+
+Assertions use the stable `OrchestratorError` code only; no address or
+payload appears in a failure message.
