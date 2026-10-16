@@ -30,9 +30,13 @@ pub enum Error {
     AlreadyMigrated = 18,
     /// A previous migration did not complete — call `migrate_storage` again.
     MigrationIncomplete = 19,
+    /// A checked arithmetic operation would wrap (epoch, step counter), or the
+    /// ledger clock is before a stored timestamp. Discriminant 20 is pinned by
+    /// the ABI tests and by the threshold tests.
+    Overflow = 20,
     /// The cursor value is not valid for this collection (e.g. not produced by a
     /// previous page call).
-    InvalidCursor = 20,
+    InvalidCursor = 21,
 }
 
 /// The exact pause surface affected by a threshold-approved activation.
@@ -106,6 +110,30 @@ pub const STORAGE_VERSION: u32 = 1;
 /// How many seconds a pre-upgrade snapshot remains valid.  After this
 /// window the snapshot is considered stale and must be refreshed.
 pub const SNAPSHOT_TTL: u64 = 86_400; // 24 hours
+
+/// Checked `u64` addition. Overflow is a typed contract error, never wrap
+/// or saturate.
+pub fn checked_add_u64(a: u64, b: u64) -> Result<u64, Error> {
+    a.checked_add(b).ok_or(Error::Overflow)
+}
+
+/// Checked `u32` addition for bounded counters (approval counts, migration
+/// steps).
+pub fn checked_add_u32(a: u32, b: u32) -> Result<u32, Error> {
+    a.checked_add(b).ok_or(Error::Overflow)
+}
+
+/// Recovery deadline: ledger timestamp plus [`RECOVERY_DELAY`] seconds.
+/// Exact integer seconds: no conversion, truncation, or saturation.
+pub fn recovery_ready_at(now: u64) -> Result<u64, Error> {
+    checked_add_u64(now, RECOVERY_DELAY)
+}
+
+/// Age of a pre-upgrade snapshot in seconds. An inverted clock
+/// (`now < snapshot_ts`) is treated as overflow and rejected before restore.
+pub fn snapshot_age(now: u64, snapshot_ts: u64) -> Result<u64, Error> {
+    now.checked_sub(snapshot_ts).ok_or(Error::Overflow)
+}
 
 /// Schema version of the [`ControlEvent`] audit record. Bump only under the
 /// documented upgrade workflow when the on-wire event shape changes, and
@@ -495,24 +523,26 @@ impl EmergencyKillswitch {
             _ => None,
         };
 
+        // The recovery deadline is part of validation: a ledger clock so close
+        // to `u64::MAX` that the deadline would wrap is rejected here, before
+        // any marker is written.
+        let ready_at = recovery_ready_at(env.ledger().timestamp())?;
+
         // ── Phase 2: write everything — all checks passed ────────────────────
         env.storage()
             .instance()
             .set(&DataKey::ActivationEpoch, &epoch);
         env.storage().instance().set(&DataKey::ActiveScope, &scope);
-        env.storage().instance().set(
-            &DataKey::RecoveryReadyAt,
-            &(env.ledger().timestamp().saturating_add(RECOVERY_DELAY)),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::RecoveryReadyAt, &ready_at);
         env.storage()
             .instance()
             .set(&DataKey::ScopeWasPaused, &scope_was_paused);
 
         // Apply the scope pause.
         match scope.clone() {
-            PauseScope::Global => {
-                env.storage().instance().set(&DataKey::GlobalPaused, &true)
-            }
+            PauseScope::Global => env.storage().instance().set(&DataKey::GlobalPaused, &true),
             PauseScope::Module(module) => env
                 .storage()
                 .instance()
@@ -1032,8 +1062,16 @@ impl EmergencyKillswitch {
 
     /// Clamp a user-supplied page limit to [`DEFAULT_PAGE_LIMIT`]..[`MAX_PAGE_LIMIT`].
     fn clamp_page_limit(limit: u32) -> u32 {
-        let effective = if limit == 0 { DEFAULT_PAGE_LIMIT } else { limit };
-        if effective > MAX_PAGE_LIMIT { MAX_PAGE_LIMIT } else { effective }
+        let effective = if limit == 0 {
+            DEFAULT_PAGE_LIMIT
+        } else {
+            limit
+        };
+        if effective > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            effective
+        }
     }
 
     /// Return a cursor-paginated page of configured signers.
@@ -1051,11 +1089,7 @@ impl EmergencyKillswitch {
     /// # Security
     /// No authentication required — the signer list is observable on-chain
     /// (it determines who can authorize threshold operations).
-    pub fn list_signers_page(
-        env: Env,
-        cursor: Option<u32>,
-        limit: u32,
-    ) -> Vec<Address> {
+    pub fn list_signers_page(env: Env, cursor: Option<u32>, limit: u32) -> Vec<Address> {
         let all = Self::configured_signers(&env);
         let effective_limit = Self::clamp_page_limit(limit);
         let start = cursor.unwrap_or(0);
@@ -2811,7 +2845,10 @@ mod snapshot_function_pause_restore_tests {
 mod pagination_tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::symbol_short;
+    use soroban_sdk::{symbol_short, vec};
+
+    /// Distinct function names without `format!`: this crate is `no_std`.
+    const FUNCTION_NAMES: [&str; 8] = ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"];
 
     fn setup() -> (Env, EmergencyKillswitchClient<'static>, Address) {
         let env = Env::default();
@@ -2843,7 +2880,7 @@ mod pagination_tests {
         let second = Address::generate(&env);
         let third = Address::generate(&env);
         let signers = vec![&env, first.clone(), second.clone(), third.clone()];
-        client.configure_signers(&admin, &signers, 1);
+        client.configure_signers(&admin, &signers, &1);
 
         let result = client.list_signers_page(&None, &10);
         assert_eq!(result.len(), 3);
@@ -2861,7 +2898,7 @@ mod pagination_tests {
         let first = Address::generate(&env);
         let second = Address::generate(&env);
         let signers = vec![&env, first.clone(), second.clone()];
-        client.configure_signers(&admin, &signers, 1);
+        client.configure_signers(&admin, &signers, &1);
 
         let page1 = client.list_signers_page(&None, &2);
         assert_eq!(page1.len(), 2);
@@ -2881,7 +2918,7 @@ mod pagination_tests {
         let (env, client, admin) = setup();
         let first = Address::generate(&env);
         let signers = vec![&env, first];
-        client.configure_signers(&admin, &signers, 1);
+        client.configure_signers(&admin, &signers, &1);
 
         let result = client.list_signers_page(&None, &100);
         assert_eq!(result.len(), 1);
@@ -2893,9 +2930,15 @@ mod pagination_tests {
     #[test]
     fn signers_page_multi_page_cursor_progression() {
         let (env, client, admin) = setup();
-        let addrs: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
-        let signers = vec![&env, addrs[0].clone(), addrs[1].clone(), addrs[2].clone(), addrs[3].clone(), addrs[4].clone()];
-        client.configure_signers(&admin, &signers, 1);
+        let signers = vec![
+            &env,
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        client.configure_signers(&admin, &signers, &1);
 
         let page1 = client.list_signers_page(&None, &2);
         assert_eq!(page1.len(), 2);
@@ -2920,13 +2963,13 @@ mod pagination_tests {
         let first = Address::generate(&env);
         let second = Address::generate(&env);
         let signers = vec![&env, first.clone(), second.clone()];
-        client.configure_signers(&admin, &signers, 1);
+        client.configure_signers(&admin, &signers, &1);
 
         let page_none = client.list_signers_page(&None, &10);
         let page_zero = client.list_signers_page(&Some(0), &10);
         assert_eq!(page_none.len(), page_zero.len());
-        assert!(page_none.contains(first));
-        assert!(page_zero.contains(first));
+        assert!(page_none.contains(&first));
+        assert!(page_zero.contains(&first));
     }
 
     // ── list_signers_page: invalid cursor rejected ─────────────────────────
@@ -2937,7 +2980,7 @@ mod pagination_tests {
         let (env, client, admin) = setup();
         let first = Address::generate(&env);
         let signers = vec![&env, first];
-        client.configure_signers(&admin, &signers, 1);
+        client.configure_signers(&admin, &signers, &1);
 
         let result = client.list_signers_page(&Some(999), &10);
         assert_eq!(result.len(), 0);
@@ -2955,7 +2998,7 @@ mod pagination_tests {
             signers_vec.push_back(Address::generate(&env));
             expected_count += 1;
         }
-        client.configure_signers(&admin, &signers_vec, 1);
+        client.configure_signers(&admin, &signers_vec, &1);
 
         // Request 100 but should get MAX_PAGE_LIMIT (50)
         let page1 = client.list_signers_page(&None, &100);
@@ -2976,7 +3019,7 @@ mod pagination_tests {
         for _ in 0..30 {
             signers_vec.push_back(Address::generate(&env));
         }
-        client.configure_signers(&admin, &signers_vec, 1);
+        client.configure_signers(&admin, &signers_vec, &1);
 
         let page = client.list_signers_page(&None, &0);
         assert_eq!(page.len(), DEFAULT_PAGE_LIMIT);
@@ -3018,8 +3061,8 @@ mod pagination_tests {
     fn paused_functions_page_multi_page() {
         let (_env, client, _admin) = setup();
         let module = symbol_short!("bill");
-        for i in 0..5 {
-            client.pause_function(&module, &Symbol::new(&_env, &format!("f{}", i)));
+        for name in &FUNCTION_NAMES[..5] {
+            client.pause_function(&module, &Symbol::new(&_env, name));
         }
 
         let page1 = client.list_paused_functions_page(&module, &None, &2);
@@ -3058,10 +3101,16 @@ mod pagination_tests {
         let module = symbol_short!("bill");
         let func = symbol_short!("pay");
         client.pause_function(&module, &func);
-        assert_eq!(client.list_paused_functions_page(&module, &None, &10).len(), 1);
+        assert_eq!(
+            client.list_paused_functions_page(&module, &None, &10).len(),
+            1
+        );
 
         client.unpause_function(&module, &func);
-        assert_eq!(client.list_paused_functions_page(&module, &None, &10).len(), 0);
+        assert_eq!(
+            client.list_paused_functions_page(&module, &None, &10).len(),
+            0
+        );
     }
 
     // ── list_paused_functions_page: cursor beyond end ──────────────────────
@@ -3099,8 +3148,8 @@ mod pagination_tests {
     fn paused_functions_page_max_limit_clamped() {
         let (_env, client, _admin) = setup();
         let module = symbol_short!("bill");
-        for i in 0..8 {
-            client.pause_function(&module, &Symbol::new(&_env, &format!("f{}", i)));
+        for name in &FUNCTION_NAMES {
+            client.pause_function(&module, &Symbol::new(&_env, name));
         }
         let result = client.list_paused_functions_page(&module, &None, &200);
         assert_eq!(result.len(), 8);
